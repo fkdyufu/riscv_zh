@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>第 2 章 操作系统组织 - xv6 中文翻译</title>
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <h2>xv6 中文翻译</h2>
+      <nav aria-label="章节导航">
+        <a href="index.html">标题页</a>
+        <a href="foreword.html">前言与致谢</a>
+        <a href="chapter-01.html">第 1 章 操作系统接口</a>
+        <a class="active" href="chapter-02.html">第 2 章 操作系统组织</a>
+        <a class="sub" href="#section-2-1">2.1 抽象物理资源</a>
+        <a class="sub" href="#section-2-2">2.2 用户模式、监督者模式和系统调用</a>
+        <a class="sub" href="#section-2-3">2.3 内核组织</a>
+        <a class="sub" href="#section-2-4">2.4 代码：xv6 组织</a>
+        <a class="sub" href="#section-2-5">2.5 进程概览</a>
+        <a class="sub" href="#section-2-6">2.6 代码：启动 xv6、第一个进程和系统调用</a>
+        <a class="sub" href="#section-2-7">2.7 安全模型</a>
+        <a class="sub" href="#section-2-8">2.8 现实世界</a>
+        <a class="sub" href="#section-2-9">2.9 练习</a>
+        <a href="chapter-03.html">第 3 章 页表</a>
+        <a href="chapter-04.html">第 4 章 陷阱和系统调用</a>
+        <a href="chapter-05.html">第 5 章 页错误</a>
+        <a href="chapter-06.html">第 6 章 中断和设备驱动</a>
+        <a href="chapter-07.html">第 7 章 锁</a>
+        <a href="chapter-08.html">第 8 章 调度</a>
+        <a href="chapter-09.html">第 9 章 睡眠与唤醒</a>
+        <a href="chapter-10.html">第 10 章 文件系统</a>
+        <a href="chapter-11.html">第 11 章 重谈并发</a>
+        <a href="chapter-12.html">第 12 章 总结</a>
+        <a href="references.html">参考文献</a>
+      </nav>
+    </aside>
+    <main>
+      <h1 class="page-title">第 2 章 操作系统组织</h1>
+      <p>操作系统的一个关键要求，是同时支持多项活动。例如，可以使用第 1 章中的 <code>fork</code> 和 <code>exec</code> 系统调用，把编译器和文本编辑器都作为进程启动。操作系统必须在这些进程之间对 CPU 和内存等资源进行时间共享。操作系统还必须安排进程之间的隔离。如果一个进程有 bug 并发生故障，它不应该影响不相关的进程。不过，完全隔离又太强，因为进程应该能够有意地相互交互；管道就是一个例子。因此，操作系统必须满足三个要求：复用、隔离和交互。</p>
+      <p>本章概述操作系统如何组织起来以实现这三个要求。实现方式有很多，但本文聚焦于以单体内核为中心的主流设计，许多 Unix 操作系统都采用这种设计。本章还会概述 xv6 的进程，这是 xv6 中的隔离单位。</p>
+      <p>Xv6 运行在多核<sup id="fnref-2-1"><a href="#fn-2-1">1</a></sup> RISC-V 微处理器上，它的许多底层功能（例如进程实现）都是 RISC-V 特定的。RISC-V 是一种 64 位 CPU，xv6 用 “LP64” C 编写，这意味着 C 语言中的 long（L）和指针（P）是 64 位，而 int 是 32 位。本书假设读者已经在某种架构上做过一些机器级编程，并会在需要时介绍 RISC-V 特定的概念。用户级 ISA 文档 <a class="cite" href="references.html#ref-2">[2]</a> 和特权架构文档 <a class="cite" href="references.html#ref-3">[3]</a> 是完整规范。你也可以参考 <em>The RISC-V Reader: An Open Architecture Atlas</em> <a class="cite" href="references.html#ref-15">[15]</a>。</p>
+      <p>一台完整计算机中的 CPU 周围有支持硬件，其中许多以 I/O 接口的形式存在。Xv6 面向 qemu 的 “<code>-machine virt</code>” 选项所模拟的支持硬件编写。这包括 RAM、包含启动代码的 ROM、连接到用户键盘/屏幕的串行连接，以及用于存储的磁盘。</p>
+
+      <section id="section-2-1">
+        <h2 class="chapter">2.1 抽象物理资源</h2>
+        <p>遇到一个操作系统时，人们可能首先会问：为什么需要操作系统？也就是说，完全可以把<a href="chapter-01.html#fig-1-2">图 1.2</a>中的系统调用实现为一个库，让应用程序与之链接。在这种方案中，每个应用甚至可以有一个为自身需求定制的库。应用程序可以直接与硬件资源交互，并以对该应用最好的方式使用这些资源（例如获得高性能或可预测性能）。一些嵌入式设备或实时系统的操作系统就是这样组织的。</p>
+        <p>这种库式方法的缺点是，如果有不止一个应用在运行，那么这些应用必须表现良好。例如，每个应用都必须定期放弃 CPU，以便其他应用可以运行。如果所有应用都彼此信任且没有 bug，那么这种协作式时间共享方案也许可以接受。但更常见的情况是，应用之间并不彼此信任，而且会有 bug，因此人们往往希望获得比协作方案更强的隔离。</p>
+        <p>为了实现强隔离，禁止应用程序直接访问敏感硬件资源，并把这些资源抽象成服务会很有帮助。例如，Unix 应用程序只通过文件系统的 <code>open</code>、<code>read</code>、<code>write</code> 和 <code>close</code> 系统调用与存储交互，而不是直接读写磁盘。这为应用提供了路径名的便利，也允许提供该接口的操作系统来管理磁盘。即使隔离不是问题，有意交互的程序（或者只是希望互不妨碍的程序）也很可能会发现，文件系统是比直接使用磁盘更方便的抽象。</p>
+        <p>类似地，Unix 会在进程之间透明地切换硬件 CPU，并按需保存和恢复寄存器状态，使应用不必意识到时间共享的存在。这种透明性允许操作系统共享 CPU，即使某些应用陷入无限循环也如此。</p>
+        <p>另一个例子是，Unix 进程使用 <code>exec</code> 构建自己的内存映像，而不是直接与物理内存交互。这允许操作系统决定把进程放在内存中的什么位置；如果内存紧张，操作系统甚至可以把进程的一些数据存储到磁盘上。<code>exec</code> 还为用户提供了用文件系统保存可执行程序映像的便利。</p>
+        <p>Unix 进程之间的许多交互都通过文件描述符发生。文件描述符不仅抽象掉了许多细节（例如管道或文件中的数据存放在哪里），而且它的定义方式也简化了交互。例如，如果管道线中的一个应用退出或失败，内核会自动为管道线中的下一个进程生成文件结束信号。</p>
+        <p><a href="chapter-01.html#fig-1-2">图 1.2</a>中的系统调用接口经过精心设计，既为程序员提供便利，也提供实现强隔离的可能性。Unix 接口不是抽象资源的唯一方式，但事实证明它是一种很好的方式。</p>
+      </section>
+
+      <section id="section-2-2">
+        <h2 class="chapter">2.2 用户模式、监督者模式和系统调用</h2>
+        <p>强隔离要求应用程序和操作系统之间有一条硬边界。即使应用程序有 bug 或带有恶意，它也不应该被允许干扰操作系统或其他程序的运行。为了实现强隔离，操作系统必须安排好，使应用程序不能修改（甚至不能读取）操作系统的数据结构和指令，也不能访问其他进程的内存。</p>
+        <p>CPU 为强隔离提供硬件支持。例如，RISC-V 有三个特权级，限制代码可以做什么：机器模式、监督者模式和用户模式。在机器模式下执行的指令拥有完整特权；CPU 启动时处于机器模式。机器模式主要用于启动期间设置计算机。Xv6 会短暂地在机器模式下执行，然后切换到监督者模式。</p>
+        <p>在监督者模式下，CPU 允许执行特权指令：例如启用和禁用中断，读写保存页表地址的寄存器，等等。如果用户模式下的应用试图执行特权指令，那么 CPU 不会执行该指令，而是“陷入”到监督者模式中的特殊代码，后者可以终止该应用。第 1 章的<a href="chapter-01.html#fig-1-1">图 1.1</a>说明了这种组织方式。应用只能执行用户模式指令（例如加法等），并被称为运行在用户空间；而监督者模式下的软件还可以执行特权指令，并被称为运行在内核空间。运行在内核空间（或监督者模式）的软件称为内核。</p>
+        <p>应用通过 <code>read</code> 等系统调用与内核交互。应用不允许直接调用内核函数或访问内核内存。RISC-V 为系统调用提供 <code>ecall</code> 指令；它把 CPU 从用户模式切换到监督者模式，并跳转到由内核指定的入口点。CPU 切换到监督者模式后，内核可以验证系统调用的参数（例如检查传给系统调用的地址是否属于应用的内存），判断应用是否被允许执行所请求的操作（例如检查应用是否被允许写指定文件），然后拒绝或执行该请求。由内核控制向监督者模式转换的入口点非常重要；如果应用能够决定内核入口点，那么恶意应用就可能进入内核中跳过参数验证的位置。</p>
+      </section>
+
+      <section id="section-2-3">
+        <h2 class="chapter">2.3 内核组织</h2>
+        <p>一个关键设计问题是：操作系统的哪一部分应该运行在监督者模式？一种可能性是整个操作系统都驻留在内核中，因此所有系统调用的实现都运行在监督者模式。这种组织称为单体内核。</p>
+        <p>在单体组织中，整个操作系统由一个运行在监督者模式下的单一程序组成。这种组织方便的一个原因是，操作系统设计者不必把代码划分成需要监督者特权的部分和不需要监督者特权的部分。此外，操作系统的不同部分很容易协作，因为它们都是同一个程序的一部分。例如，单体内核可以让文件系统和虚拟内存系统共享磁盘块缓存。</p>
+        <p>缺点是单体内核往往会变得庞大而复杂，以至于没有一个开发者能理解代码不同部分之间的所有交互；这是产生 bug 的温床。内核中的 bug 特别麻烦，因为它可能导致整台计算机崩溃，或导致许多应用故障，或使整台计算机容易受到安全攻击。</p>
+
+        <figure id="fig-2-1">
+          <svg class="svg-wrap" role="img" aria-labelledby="fig-2-1-title fig-2-1-desc" viewBox="0 0 760 340" width="100%" style="max-width: 760px; font-family: Arial, Helvetica, sans-serif;">
+            <title id="fig-2-1-title">图 2.1：带文件系统服务器的微内核</title>
+            <desc id="fig-2-1-desc">用户空间中有 shell 和文件服务器，内核空间中有微内核，消息从 shell 经微内核发送到文件服务器。</desc>
+            <defs>
+              <marker id="fig21-arrow" markerWidth="12" markerHeight="10" refX="10" refY="5" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 10 5 L 0 10 z" fill="#111" /></marker>
+              <marker id="fig21-arrow-start" markerWidth="12" markerHeight="10" refX="2" refY="5" orient="auto" markerUnits="strokeWidth"><path d="M 10 0 L 0 5 L 10 10 z" fill="#111" /></marker>
+            </defs>
+            <text x="70" y="105" font-size="24">用户</text><text x="70" y="136" font-size="24">空间</text>
+            <text x="70" y="211" font-size="24">内核</text><text x="70" y="242" font-size="24">空间</text>
+            <line x1="160" y1="58" x2="160" y2="282" stroke="#111" stroke-width="2" marker-start="url(#fig21-arrow-start)" marker-end="url(#fig21-arrow)" />
+            <line x1="110" y1="166" x2="700" y2="166" stroke="#d11" stroke-width="4" />
+            <ellipse cx="270" cy="98" rx="88" ry="42" fill="white" stroke="#111" stroke-width="2" />
+            <text x="270" y="106" text-anchor="middle" font-size="25">shell</text>
+            <ellipse cx="560" cy="98" rx="108" ry="42" fill="white" stroke="#111" stroke-width="2" />
+            <text x="560" y="106" text-anchor="middle" font-size="24">文件服务器</text>
+            <rect x="205" y="200" width="440" height="42" fill="white" stroke="#111" stroke-width="2" />
+            <text x="425" y="229" text-anchor="middle" font-size="25">微内核</text>
+            <path d="M 292 126 L 425 210 L 530 126" fill="none" stroke="#111" stroke-width="2.2" marker-end="url(#fig21-arrow)" />
+            <text x="420" y="151" text-anchor="middle" font-size="23">发送消息</text>
+          </svg>
+          <figcaption>图 2.1：带文件系统服务器的微内核。</figcaption>
+        </figure>
+
+        <p>微内核的目标是降低内核中 bug 的出现率。其思想是只把绝对最少的功能放进内核本身，让尽可能少的代码在监督者模式下执行，并使内核易于理解和正确性分析。操作系统的大部分作为用户级服务器进程运行。例如，文件系统代码会作为服务器进程在用户模式而非监督者模式下执行。</p>
+        <p><a href="#fig-2-1">图 2.1</a>说明了这种微内核设计。在图中，文件系统作为用户级服务器进程运行。为了允许应用与文件服务器交互，内核提供进程间通信机制，用于把消息从一个用户模式进程发送到另一个用户模式进程。例如，如果像 shell 这样的应用想读写文件，它会向文件服务器发送消息并等待响应。</p>
+        <p>在微内核中，内核接口由少数底层函数组成，用于启动应用、发送消息、访问设备硬件，等等。这种组织允许内核保持相对简单，因为操作系统的大部分驻留在用户级服务器中。</p>
+        <p>在现实世界中，单体内核和微内核都很流行。许多 Unix 内核是单体的。例如，Linux 有一个单体内核，尽管某些操作系统功能作为用户级服务器运行（例如窗口系统）。Linux 为操作系统密集型应用提供高性能，部分原因是内核子系统可以紧密集成。</p>
+        <p>Minix、L4 和 QNX 等操作系统被组织为带服务器的微内核，并在嵌入式环境中得到了广泛部署。L4 的一个变体 seL4 小到足以被验证其内存安全性和其他安全属性 <a class="cite" href="references.html#ref-8">[8]</a>。</p>
+        <p>操作系统开发者对于哪种组织方式更好有很多争论，但并没有哪一边有决定性证据。此外，这很大程度上取决于“更好”是什么意思：更快的性能、更小的代码规模、内核的可靠性、完整操作系统（包括用户级服务）的可靠性，等等。</p>
+        <p>还有一些实际考虑可能比采用哪种组织方式更重要。有些操作系统拥有微内核，但出于性能原因把某些用户级服务放在内核空间运行。有些操作系统采用单体内核，是因为它们从一开始就是这样构建的，而且几乎没有动力为了适配纯微内核组织而重写已有操作系统，因为新功能可能比重写更重要。</p>
+        <p>从本书的角度看，微内核和单体操作系统共享许多关键思想。它们实现系统调用，使用页表，处理中断，支持进程，使用锁进行并发控制，实现文件系统，等等。本书关注这些核心思想。</p>
+        <p>Xv6 和大多数 Unix 操作系统一样，被实现为单体内核。因此，xv6 内核接口对应于操作系统接口，内核实现完整的操作系统。由于 xv6 并不提供很多服务，它的内核比某些微内核还小，但从概念上说 xv6 是单体的。</p>
+      </section>
+
+      <section id="section-2-4">
+        <h2 class="chapter">2.4 代码：xv6 组织</h2>
+        <p>xv6 内核源码位于 <code>kernel/</code> 子目录中。<a href="#fig-2-2">图 2.2</a>列出了这些文件，并按内核主要职责区域划分：启动系统（booting）、创建和控制进程、处理陷阱（中断和系统调用）、分配内存并配置虚拟地址、控制设备，以及管理文件系统。</p>
+
+        <figure id="fig-2-2">
+          <svg class="svg-wrap" role="img" aria-labelledby="fig-2-2-title fig-2-2-desc" viewBox="0 0 980 1020" width="100%" style="max-width: 980px; font-family: Arial, Helvetica, sans-serif;">
+            <title id="fig-2-2-title">图 2.2：Xv6 内核源文件</title>
+            <desc id="fig-2-2-desc">一个表格，按职责列出 xv6 内核源文件及说明。</desc>
+            <foreignObject x="0" y="0" width="980" height="975">
+              <div xmlns="http://www.w3.org/1999/xhtml">
+                <table style="width: 100%; border-collapse: collapse; font-size: 16px; line-height: 1.35; color: #111; text-align: left;">
+                  <thead><tr><th style="width: 16%; padding: 7px 10px; border-bottom: 2px solid #111;">类别</th><th style="width: 24%; padding: 7px 10px; border-bottom: 2px solid #111;">文件</th><th style="padding: 7px 10px; border-bottom: 2px solid #111;">说明</th></tr></thead>
+                  <tbody>
+                    <tr><td style="padding: 6px 10px;">Boot</td><td style="padding: 6px 10px; font-family: monospace;">entry.S</td><td style="padding: 6px 10px;">最早执行的启动指令。</td></tr>
+                    <tr><td></td><td style="padding: 6px 10px; font-family: monospace;">main.c</td><td style="padding: 6px 10px;">控制其他模块的初始化。</td></tr>
+                    <tr><td></td><td style="padding: 6px 10px; font-family: monospace;">start.c</td><td style="padding: 6px 10px;">早期机器模式启动代码。</td></tr>
+                    <tr><td style="padding: 6px 10px;">Processes</td><td style="padding: 6px 10px; font-family: monospace;">exec.c</td><td style="padding: 6px 10px;"><code>exec()</code> 系统调用。</td></tr>
+                    <tr><td></td><td style="padding: 6px 10px; font-family: monospace;">proc.c</td><td style="padding: 6px 10px;">进程和调度。</td></tr>
+                    <tr><td></td><td style="padding: 6px 10px; font-family: monospace;">swtch.S</td><td style="padding: 6px 10px;">线程切换。</td></tr>
+                    <tr><td></td><td style="padding: 6px 10px; font-family: monospace;">sysproc.c</td><td style="padding: 6px 10px;">与进程相关的系统调用。</td></tr>
+                    <tr><td style="padding: 6px 10px;">Traps</td><td style="padding: 6px 10px; font-family: monospace;">kernelvec.S</td><td style="padding: 6px 10px;">处理来自内核代码的陷阱。</td></tr>
+                    <tr><td></td><td style="padding: 6px 10px; font-family: monospace;">trampoline.S</td><td style="padding: 6px 10px;">处理来自用户代码的陷阱。</td></tr>
+                    <tr><td></td><td style="padding: 6px 10px; font-family: monospace;">trap.c</td><td style="padding: 6px 10px;">处理并返回陷阱和中断的 C 代码。</td></tr>
+                    <tr><td></td><td style="padding: 6px 10px; font-family: monospace;">syscall.c</td><td style="padding: 6px 10px;">把系统调用分派给处理函数。</td></tr>
+                    <tr><td style="padding: 6px 10px;">Memory</td><td style="padding: 6px 10px; font-family: monospace;">vm.c</td><td style="padding: 6px 10px;">管理页表和地址空间。</td></tr>
+                    <tr><td></td><td style="padding: 6px 10px; font-family: monospace;">kalloc.c</td><td style="padding: 6px 10px;">物理页分配器。</td></tr>
+                    <tr><td style="padding: 6px 10px;">Devices</td><td style="padding: 6px 10px; font-family: monospace;">console.c</td><td style="padding: 6px 10px;">连接到用户键盘和屏幕。</td></tr>
+                    <tr><td></td><td style="padding: 6px 10px; font-family: monospace;">plic.c</td><td style="padding: 6px 10px;">RISC-V 中断控制器。</td></tr>
+                    <tr><td></td><td style="padding: 6px 10px; font-family: monospace;">printf.c</td><td style="padding: 6px 10px;">格式化输出到控制台。</td></tr>
+                    <tr><td></td><td style="padding: 6px 10px; font-family: monospace;">uart.c</td><td style="padding: 6px 10px;">串口控制台设备驱动。</td></tr>
+                    <tr><td></td><td style="padding: 6px 10px; font-family: monospace;">virtio_disk.c</td><td style="padding: 6px 10px;">磁盘设备驱动。</td></tr>
+                    <tr><td style="padding: 6px 10px;">FS</td><td style="padding: 6px 10px; font-family: monospace;">bio.c</td><td style="padding: 6px 10px;">文件系统的磁盘块缓存。</td></tr>
+                    <tr><td></td><td style="padding: 6px 10px; font-family: monospace;">file.c</td><td style="padding: 6px 10px;">文件描述符支持。</td></tr>
+                    <tr><td></td><td style="padding: 6px 10px; font-family: monospace;">fs.c</td><td style="padding: 6px 10px;">文件系统。</td></tr>
+                    <tr><td></td><td style="padding: 6px 10px; font-family: monospace;">log.c</td><td style="padding: 6px 10px;">文件系统日志和崩溃恢复。</td></tr>
+                    <tr><td></td><td style="padding: 6px 10px; font-family: monospace;">sysfile.c</td><td style="padding: 6px 10px;">与文件相关的系统调用。</td></tr>
+                    <tr><td></td><td style="padding: 6px 10px; font-family: monospace;">pipe.c</td><td style="padding: 6px 10px;">管道。</td></tr>
+                    <tr><td style="padding: 6px 10px;">Misc</td><td style="padding: 6px 10px; font-family: monospace;">sleeplock.c</td><td style="padding: 6px 10px;">会让出 CPU 的锁。</td></tr>
+                    <tr><td></td><td style="padding: 6px 10px; font-family: monospace;">spinlock.c</td><td style="padding: 6px 10px;">不会让出 CPU 的锁。</td></tr>
+                    <tr><td></td><td style="padding: 6px 10px; font-family: monospace;">string.c</td><td style="padding: 6px 10px;">C 字符串和字节数组库。</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </foreignObject>
+          </svg>
+          <figcaption>图 2.2：Xv6 内核源文件。</figcaption>
+        </figure>
+      </section>
+
+      <section id="section-2-5">
+        <h2 class="chapter">2.5 进程概览</h2>
+        <p>xv6 中的隔离单位（和其他 Unix 操作系统一样）是进程。进程抽象防止一个进程破坏或窥探另一个进程的内存、CPU、文件描述符等。它还防止进程破坏内核本身，使进程无法颠覆内核的隔离机制。内核必须谨慎地实现进程抽象，因为有 bug 或恶意的应用可能诱使内核或硬件做坏事（例如绕过隔离）。内核用于实现进程的机制包括用户/监督者模式标志、地址空间以及线程的时间分片。</p>
+        <p>为了帮助强制隔离，进程抽象向程序提供一种幻觉：它拥有自己的私有机器。进程为程序提供看起来私有的内存系统，或称地址空间，其他进程不能读写它。进程还为程序提供看起来属于自己的 CPU，用于执行程序指令。</p>
+        <p>Xv6 使用页表（由硬件实现）为每个进程提供自己的地址空间。RISC-V 页表把虚拟地址（RISC-V 指令操作的地址）转换（或“映射”）为物理地址（CPU 发送给主存的地址）。</p>
+        <p>Xv6 为每个进程维护一个独立的页表，用来定义该进程的地址空间。如<a href="#fig-2-3">图 2.3</a>所示，地址空间包括从虚拟地址零开始的进程用户内存。最先是指令，接着是全局变量，然后是栈，最后是一个“堆”区域（供 <code>malloc</code> 使用），进程可以按需扩展它。限制进程地址空间最大大小的因素有很多：RISC-V 上的指针宽度为 64 位；硬件在页表中查找虚拟地址时只使用低 39 位；而 xv6 只使用这 39 位中的 38 位。因此，最大地址是 2<sup>38</sup>−1 = <code>0x3fffffffff</code>，即 <code>MAXVA</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/riscv.h#L380" target="_blank" rel="noopener">(0899)</a>。在地址空间顶部，xv6 放置一个 trampoline 页（4096 字节）和一个 trapframe 页。Xv6 使用这两个页在内核和用户空间之间来回转换；trampoline 页包含进出内核的代码，trapframe 则是内核保存进程用户寄存器的地方，<a href="chapter-04.html">第 4 章</a>会解释这一点。</p>
+
+        <figure id="fig-2-3">
+          <svg class="svg-wrap" role="img" aria-labelledby="fig-2-3-title fig-2-3-desc" viewBox="0 0 430 380" width="100%" style="max-width: 430px; font-family: Arial, Helvetica, sans-serif;">
+            <title id="fig-2-3-title">图 2.3：进程虚拟地址空间布局</title>
+            <desc id="fig-2-3-desc">一个连续的竖向进程虚拟地址空间，从底部地址 0 到顶部 MAXVA，依次包含用户文本和数据、用户栈、堆、trapframe 和 trampoline。</desc>
+            <defs>
+              <marker id="fig-2-3-arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+                <path d="M 0 0 L 10 4 L 0 8 z" fill="#111" />
+              </marker>
+            </defs>
+            <text x="72" y="64" font-size="20">MAXVA</text>
+            <line x1="145" y1="58" x2="196" y2="58" stroke="#111" stroke-width="1.5" marker-end="url(#fig-2-3-arrow)" />
+            <text x="110" y="329" font-size="20">0</text>
+            <line x1="145" y1="322" x2="196" y2="322" stroke="#111" stroke-width="1.5" marker-end="url(#fig-2-3-arrow)" />
+            <rect x="200" y="55" width="128" height="268" fill="white" stroke="#111" stroke-width="1.5" />
+            <line x1="200" y1="82" x2="328" y2="82" stroke="#111" stroke-width="1.2" />
+            <line x1="200" y1="109" x2="328" y2="109" stroke="#111" stroke-width="1.2" />
+            <line x1="200" y1="228" x2="328" y2="228" stroke="#111" stroke-width="1.2" />
+            <line x1="200" y1="258" x2="328" y2="258" stroke="#111" stroke-width="1.2" />
+            <text x="264" y="75" text-anchor="middle" font-size="20">trampoline</text>
+            <text x="264" y="101" text-anchor="middle" font-size="20">trapframe</text>
+            <text x="264" y="176" text-anchor="middle" font-size="20">heap</text>
+            <text x="264" y="250" text-anchor="middle" font-size="20">user stack</text>
+            <text x="264" y="293" text-anchor="middle" font-size="20">user text</text>
+            <text x="264" y="316" text-anchor="middle" font-size="20">and data</text>
+          </svg>
+          <figcaption>图 2.3：进程虚拟地址空间的布局。</figcaption>
+        </figure>
+
+        <p>xv6 内核为每个进程维护许多状态，并把它们聚合到一个 <code>struct proc</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/proc.h#L85" target="_blank" rel="noopener">(2034)</a> 中。进程最重要的内核状态包括它的页表、内核栈和运行状态。我们将使用 <code>p-&gt;xxx</code> 这种记法指代 <code>proc</code> 结构中的元素；例如，<code>p-&gt;pagetable</code> 是指向进程页表的指针。</p>
+        <p>此时，请阅读 <code>kernel/proc.h</code>，它定义了 <code>struct proc</code>。理解 xv6 代码比理解本书更重要；你应该优先阅读代码，并在需要澄清代码时查阅本书。有些代码的目的一开始可能并不明显，但继续阅读和搜索代码会有所帮助。请随意探索和修改代码。</p>
+        <p>每个进程都有一个控制线程（简称线程），它保存执行进程所需的状态。在任意时刻，线程可能正在某个 CPU 上执行，也可能被挂起（没有执行，但将来可以恢复执行）。为了在进程之间切换 CPU，内核会挂起当前正在该 CPU 上运行的线程并保存其状态，然后恢复另一个进程先前被挂起的线程状态。线程的大部分状态（局部变量、函数调用返回地址）保存在该线程的栈上。每个进程有两个栈：用户栈和内核栈（<code>p-&gt;kstack</code>）。当进程执行用户指令时，只有用户栈在使用，内核栈为空。当进程进入内核（因为系统调用或中断）时，内核代码在该进程的内核栈上执行；当进程在内核中时，它的用户栈仍保存着数据，但并未被主动使用。进程的线程在主动使用用户栈和内核栈之间交替。内核栈是独立的（并受保护，不受用户代码影响），这样即使进程破坏了自己的用户栈，内核仍然能够执行。</p>
+        <p>进程的用户代码可以通过执行 RISC-V 的 <code>ecall</code> 指令来发起系统调用。该指令切换到监督者模式，并把程序计数器改为内核定义的入口点。入口点处的代码切换到进程的内核栈，并执行实现系统调用的内核指令。当系统调用完成后，内核通过执行 <code>sret</code> 指令返回用户空间，该指令切换到用户模式，并在系统调用指令之后继续执行用户指令。进程的线程可以在内核中“阻塞”以等待 I/O，并在 I/O 完成后从离开的位置恢复。</p>
+        <p><code>p-&gt;state</code> 表示进程是否已分配、是否准备运行、是否当前正在某个 CPU 上运行、是否正在等待 I/O，或者是否正在退出。</p>
+        <p><code>p-&gt;pagetable</code> 以 RISC-V 硬件期望的格式保存进程的页表。Xv6 在用户空间执行某个进程时，会使分页硬件使用该进程的 <code>p-&gt;pagetable</code>。进程的页表还充当记录，用于记录分配给该进程内存的物理页地址。</p>
+        <p>总之，进程捆绑了两个设计思想：地址空间给进程一种拥有自己内存的幻觉，线程给进程一种拥有自己 CPU 的幻觉。在 xv6 中，一个进程由一个地址空间和一个线程组成。在真实操作系统中，一个进程可能有多个线程，以便利用多个 CPU。</p>
+      </section>
+
+      <section id="section-2-6">
+        <h2 class="chapter">2.6 代码：启动 xv6、第一个进程和系统调用</h2>
+        <p>为了使 xv6 更具体，我们将概述内核如何启动并运行第一个进程。后续章节会更详细地描述这个概览中出现的机制。请阅读 <code>kernel/entry.S</code>、<code>kernel/start.c</code>、<code>kernel/main.c</code> 和 <code>user/init.c</code>。</p>
+        <p>当 RISC-V 计算机上电时，它会初始化自身，并运行存储在只读内存中的 boot loader。boot loader 把 xv6 内核复制到物理地址 <code>0x80000000</code>。它把内核放在 <code>0x80000000</code> 而不是 <code>0x0</code> 的原因，是地址范围 <code>0x0:0x80000000</code> 包含 I/O 设备。</p>
+        <p>然后 boot loader 跳转到 xv6 的 <code>_entry</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/entry.S#L7" target="_blank" rel="noopener">(1006)</a>。RISC-V 开始时禁用了分页硬件：虚拟地址直接映射到物理地址。<code>_entry</code> 处的指令设置一个栈，使 xv6 可以运行 C 代码。Xv6 在文件 <code>start.c</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/start.c#L11" target="_blank" rel="noopener">(1060)</a> 中声明了这个栈的空间 <code>stack0</code>。<code>_entry</code> 处的代码把栈指针寄存器 <code>sp</code> 加载为 <code>stack0+4096</code>，即栈顶地址，因为 RISC-V 上的栈向下增长。现在内核有了栈，<code>_entry</code> 调用 C 代码中的 <code>start</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/start.c#L15" target="_blank" rel="noopener">(1064)</a>。</p>
+        <p>函数 <code>start</code> 执行一些只有机器模式下 CPU 才允许的设置，最重要的是对时钟芯片编程，使其产生定时器中断。然后 <code>start</code> 使用 RISC-V 的 <code>mret</code> 指令切换到监督者模式，并跳转到 <code>main</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/main.c#L11" target="_blank" rel="noopener">(1160)</a>。<code>mret</code> 需要一点设置：<code>start</code> 在寄存器 <code>mstatus</code> 中把先前特权模式设为监督者模式；把 <code>main</code> 的地址写入寄存器 <code>mepc</code>，作为目标地址；向页表寄存器 <code>satp</code> 写入 0，以禁用监督者模式下的虚拟地址转换；并把所有中断和异常委托给监督者模式。</p>
+        <p><code>main</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/main.c#L11" target="_blank" rel="noopener">(1160)</a> 初始化若干设备和子系统后，通过调用 <code>userinit</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/proc.c#L220" target="_blank" rel="noopener">(2327)</a> 创建第一个进程。所有新创建的进程都从内核中的 <code>forkret</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/proc.c#L503" target="_blank" rel="noopener">(2653)</a> 开始执行。作为第一个进程的特殊情况，<code>forkret</code> 调用 <code>kexec</code> 加载用户程序 <code>/init</code>。</p>
+        <p>调用 <code>kexec</code> 后，<code>forkret</code> 返回到 <code>/init</code> 进程的用户空间。<code>init</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/user/init.c#L15" target="_blank" rel="noopener">(7764)</a> 在需要时创建新的控制台设备文件，然后把它作为文件描述符 0、1 和 2 打开。之后它在控制台上启动一个 shell。系统就此启动完成。</p>
+      </section>
+
+      <section id="section-2-7">
+        <h2 class="chapter">2.7 安全模型</h2>
+        <p>你可能会想知道操作系统如何处理有 bug 或恶意的代码。由于应对恶意行为严格来说比处理偶然 bug 更难，因此主要关注针对恶意行为提供安全性是合理的。下面是操作系统设计中典型安全假设和目标的高层视图。</p>
+        <p>操作系统必须假设进程的用户级代码会尽力破坏内核或其他进程。用户代码可能试图解引用超出其允许地址空间的指针；可能试图执行不应由用户代码执行的指令；可能试图读写 RISC-V 控制寄存器；可能试图访问设备硬件；也可能向系统调用传入精心构造的值，试图诱使内核崩溃或做蠢事。</p>
+        <p>内核的目标是限制每个用户进程，使其只能访问自己的用户内存，使用 32 个 RISC-V 通用寄存器，并以系统调用预期允许的方式影响内核和其他进程。内核必须阻止任何其他动作。这些通常是内核设计中的绝对要求。</p>
+        <p>对内核自身代码的期望则不同。我们假设内核代码由善意而谨慎的程序员编写，没有 bug，也不包含恶意内容。这个假设影响我们分析内核代码的方式。例如，有许多内部内核函数（例如自旋锁）如果被内核代码错误使用，会造成严重问题。不过，我们假设内核会正确使用自己的函数。在硬件层面，我们假设 RISC-V CPU、RAM、磁盘等会按照文档说明运行，没有硬件 bug。</p>
+        <p>现实生活并不这么简单。很难防止滥用的用户程序以消耗受内核保护资源的方式调用系统调用，从而使系统不可用：这些资源包括磁盘空间、CPU 时间、进程表槽位，等等。通常不可能写出 100% 无 bug 的内核代码，也不可能设计出无 bug 的硬件；如果恶意用户代码的作者知道内核或硬件 bug，他们就会利用这些 bug。即使在成熟且广泛使用的内核中，例如 Linux，人们也经常发现先前未知的漏洞 <a class="cite" href="references.html#ref-1">[1]</a>。最后，用户代码和内核代码之间的区别有时会变得模糊：某些特权用户级进程可能提供基本服务，实际上成为操作系统的一部分；在某些操作系统中，特权用户代码可以向内核插入新代码（例如 Linux 的可加载内核模块和 eBPF）。</p>
+        <p>作为对内核 bug 的部分防御，xv6 代码包含对不一致和不可恢复错误的检查，并会通过调用 <code>panic()</code> 作出“panic”响应。这个函数打印错误消息并停止系统。panic 并不理想，但比继续执行更可取。通常，panic 源于导致内核数据不正确的内核 bug，或者源于导致内核执行非法动作的 bug，例如引用不存在的内存；在这种情况下，用 <code>panic()</code> 停止执行比在不一致状态下尝试继续更安全。内核开发者会在 panic 后努力识别并修复底层代码 bug。</p>
+      </section>
+
+      <section id="section-2-8">
+        <h2 class="chapter">2.8 现实世界</h2>
+        <p>大多数操作系统都采用了进程概念，大多数进程看起来也与 xv6 的进程类似。不过，现代操作系统支持一个进程内有多个线程，以便单个进程可以利用多个 CPU。在一个进程中支持多个线程需要相当多的机制，而 xv6 没有这些机制；通常还包括接口变化（例如 Linux 的 <code>clone</code>，它是 <code>fork</code> 的一个变体），用于控制进程线程之间共享哪些方面。</p>
+      </section>
+
+      <section id="section-2-9">
+        <h2 class="chapter">2.9 练习</h2>
+        <ol>
+          <li>向 xv6 添加一个系统调用，返回当前可用的空闲内存量。</li>
+        </ol>
+      </section>
+
+      <section id="footnotes" class="footnotes">
+        <h2>脚注</h2>
+        <ol>
+          <li id="fn-2-1">本文中的“多核”指多个 CPU 共享内存但并行执行，每个 CPU 都有自己的一组寄存器。本文有时把 multiprocessor 作为 multi-core 的同义词，尽管 multiprocessor 也可以更具体地指一台包含多个不同处理器芯片的计算机。<a href="#fnref-2-1" aria-label="返回正文">↩</a></li>
+        </ol>
+      </section>
+
+      <div class="pager">
+        <a href="chapter-01.html">← 第 1 章</a>
+        <a href="chapter-03.html">第 3 章 →</a>
+      </div>
+    </main>
+  </div>
+</body>
+</html>

@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>第 6 章 中断和设备驱动 - xv6 中文翻译</title>
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <h2>xv6 中文翻译</h2>
+      <nav aria-label="章节导航">
+        <a href="index.html">标题页</a><a href="foreword.html">前言与致谢</a><a href="chapter-01.html">第 1 章 操作系统接口</a><a href="chapter-02.html">第 2 章 操作系统组织</a><a href="chapter-03.html">第 3 章 页表</a><a href="chapter-04.html">第 4 章 陷阱和系统调用</a><a href="chapter-05.html">第 5 章 页错误</a>
+        <a class="active" href="chapter-06.html">第 6 章 中断和设备驱动</a>
+        <a class="sub" href="#section-6-1">6.1 代码：控制台输入</a>
+        <a class="sub" href="#section-6-2">6.2 代码：控制台输出</a>
+        <a class="sub" href="#section-6-3">6.3 驱动中的并发</a>
+        <a class="sub" href="#section-6-4">6.4 定时器中断</a>
+        <a class="sub" href="#section-6-5">6.5 现实世界</a>
+        <a class="sub" href="#section-6-6">6.6 练习</a>
+        <a href="chapter-07.html">第 7 章 锁</a><a href="chapter-08.html">第 8 章 调度</a><a href="chapter-09.html">第 9 章 睡眠与唤醒</a><a href="chapter-10.html">第 10 章 文件系统</a><a href="chapter-11.html">第 11 章 重谈并发</a><a href="chapter-12.html">第 12 章 总结</a><a href="references.html">参考文献</a>
+      </nav>
+    </aside>
+    <main>
+      <h1 class="page-title">第 6 章 中断和设备驱动</h1>
+      <p>驱动是操作系统中管理特定设备的代码：它配置设备硬件，告诉设备执行操作，处理由此产生的中断，并与使用该设备的进程交互。驱动代码可能很棘手，因为驱动与设备并发执行，并且常常也与使用设备的进程并发执行。此外，驱动必须理解设备的硬件接口，而这些接口可能复杂且文档不足。</p>
+      <p>需要操作系统关注的设备通常可以被配置为产生中断，中断是一类陷阱。内核陷阱处理代码识别设备何时产生中断，并调用驱动的中断处理程序；在 xv6 中，这个分发发生在 <code>devintr</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/trap.c#L186" target="_blank" rel="noopener">(3506)</a> 中。</p>
+      <p>许多设备驱动会在两种上下文中执行代码：上半部运行在进程的内核线程中，下半部在中断时执行。上半部由希望设备执行 I/O 的系统调用（如 <code>read</code> 和 <code>write</code>）调用。这段代码可能请求硬件启动一个操作（例如请求磁盘读取一个块），然后等待操作完成。最终设备完成操作并产生中断。驱动的中断处理程序作为下半部，判断哪个操作完成，必要时唤醒等待进程，并告诉硬件开始下一个操作（如果有）。</p>
+
+      <section id="section-6-1">
+        <h2 class="chapter">6.1 代码：控制台输入</h2>
+        <p>控制台驱动 <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/console.c" target="_blank" rel="noopener">(6950)</a> 是驱动结构的一个简单例子。控制台驱动通过连接到 RISC-V 的 UART 串口硬件接收人类键入的字符。控制台驱动一次累积一行输入，处理退格和 control-u 等特殊输入字符。用户进程（如 shell）用 <code>read</code> 系统调用从控制台获取输入行。当你在 QEMU 中向 xv6 输入时，你的按键会通过 QEMU 模拟的 UART 硬件传递给 xv6。</p>
+        <p>驱动交互的 UART 硬件是 QEMU 模拟的 16550 芯片 <a class="cite" href="references.html#ref-13">[13]</a>。在真实计算机上，16550 会管理连接到终端或另一台计算机的 RS232 串行链路。运行 QEMU 时，它连接到你的键盘和显示器。</p>
+        <p>UART 硬件对软件表现为一组内存映射控制寄存器。也就是说，有些物理地址连接到 UART 设备，对这些地址的 load 和 store 会与设备硬件交互，而不是与 RAM 交互。UART 的内存映射地址从 <code>0x10000000</code>，即 <code>UART0</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/memlayout.h#L21" target="_blank" rel="noopener">(0220)</a> 开始。UART 控制寄存器有少数几个，每个宽度为一个字节。它们相对 <code>UART0</code> 的偏移定义在 <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/uart.c#L22" target="_blank" rel="noopener">(7221)</a>。例如，<code>LSR</code> 寄存器包含一些位，指示是否有输入字符等待驱动读取。这些字符（如果有）可以从 <code>RHR</code> 寄存器读取。每读取一个，UART 硬件就从内部等待字符 FIFO 中删除它；FIFO 为空时，清除 <code>LSR</code> 中的“ready”位。发送时，驱动把一个字节写入 <code>THR</code> 寄存器，使 UART 把该字节追加到将通过 RS232 串行链路发送的字节 FIFO 中。UART 的发送和接收硬件基本相互独立。</p>
+        <p>xv6 的 <code>main</code> 调用 <code>consoleinit</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/console.c#L186" target="_blank" rel="noopener">(7154)</a> 初始化 UART 硬件。这段代码配置 UART，使它在每收到一个输入字节时产生接收中断，并在每发送完一个输出字节时产生发送完成中断 <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/uart.c#L50" target="_blank" rel="noopener">(7251)</a>。</p>
+        <p>xv6 shell 通过 <code>init.c</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/user/init.c#L19" target="_blank" rel="noopener">(7768)</a> 打开的文件描述符从控制台读取。对 <code>read</code> 系统调用的调用会一路进入内核，到达 <code>consoleread</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/console.c#L84" target="_blank" rel="noopener">(7040)</a>。<code>consoleread</code> 等待输入到达（通过中断）并缓存在 <code>cons.buf</code> 中，把输入复制到用户空间，并在完整一行到达后返回给用户进程。如果用户还没有键入完整一行，任何读取进程都会在 <code>sleep</code> 调用中等待 <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/console.c#L100" target="_blank" rel="noopener">(7056)</a>（第 9 章解释 <code>sleep</code> 的细节）。</p>
+        <p>当用户键入字符时，UART 硬件请求 RISC-V 产生中断，激活 xv6 的陷阱处理程序。陷阱处理程序调用 <code>devintr</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/trap.c#L186" target="_blank" rel="noopener">(3506)</a>，后者查看 RISC-V 的 <code>scause</code> 寄存器，发现中断来自外部设备。随后它询问称为 PLIC 的硬件单元 <a class="cite" href="references.html#ref-3">[3]</a>，让它指出哪个设备中断了 <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/trap.c#L194" target="_blank" rel="noopener">(3514)</a>。如果是 UART，<code>devintr</code> 调用 <code>uartintr</code>。</p>
+        <p><code>uartintr</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/uart.c#L143" target="_blank" rel="noopener">(7354)</a> 从 UART 硬件读取任何等待中的输入字符，并把它们交给 <code>consoleintr</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/console.c#L140" target="_blank" rel="noopener">(7107)</a>；它不会等待字符，因为未来的输入会产生新的中断。<code>consoleintr</code> 的工作是把输入字符累积到 <code>cons.buf</code>，直到完整一行到达。<code>consoleintr</code> 会特殊处理退格和其他几个字符。换行到达时，<code>consoleintr</code> 唤醒一个等待中的 <code>consoleread</code>（如果有）。</p>
+        <p>被唤醒后，<code>consoleread</code> 会看到 <code>cons.buf</code> 中有完整一行，把它复制到用户空间，并通过系统调用机制返回到用户空间。</p>
+      </section>
+
+      <section id="section-6-2">
+        <h2 class="chapter">6.2 代码：控制台输出</h2>
+        <p>对连接到控制台的文件描述符执行 <code>write</code> 系统调用，最终会到达 <code>uartputc</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/uart.c#L107" target="_blank" rel="noopener">(7309)</a>。设备驱动维护一个输出缓冲区（<code>uart_tx_buf</code>），使写进程不必等待 UART 完成发送；相反，<code>uartputc</code> 把每个字符追加到缓冲区，调用 <code>uartstart</code> 启动设备发送（如果它尚未发送），然后返回。<code>uartputc</code> 唯一会等待的情况是缓冲区已经满了。</p>
+        <p>每当 UART 发送完一个字节，它会产生一个中断。<code>uartintr</code> 调用 <code>uartstart</code>，后者检查设备是否确实已经完成发送，并把下一个缓冲的输出字符交给设备。因此，如果一个进程向控制台写入多个字节，通常第一个字节会由 <code>uartputc</code> 对 <code>uartstart</code> 的调用发送，其余缓冲字节会随着发送完成中断到来，由 <code>uartintr</code> 调用的 <code>uartstart</code> 发送。</p>
+        <p>这里值得注意的一个通用模式是：通过缓冲和中断，把设备活动与进程活动解耦。即使没有进程等待读取，控制台驱动也能处理输入；后续的 <code>read</code> 会看到这些输入。类似地，进程可以发送输出而无需等待设备。这种解耦让进程能与设备 I/O 并发执行，从而提高性能；当设备很慢（如 UART）或需要立即关注（如回显键入字符）时，这尤其重要。这个思想有时称为 I/O 并发。</p>
+      </section>
+
+      <section id="section-6-3">
+        <h2 class="chapter">6.3 驱动中的并发</h2>
+        <p>你可能已经注意到 <code>consoleread</code> 和 <code>consoleintr</code> 中对 <code>acquire</code> 的调用。这些调用获取一个锁，保护控制台驱动的数据结构免受并发访问。这里有三种并发危险：不同 CPU 上的两个进程可能同时调用 <code>consoleread</code>；硬件可能在某个 CPU 已经执行在 <code>consoleread</code> 中时请求该 CPU 投递控制台（实际是 UART）中断；硬件也可能在 <code>consoleread</code> 执行时向另一个 CPU 投递控制台中断。第 7 章解释如何使用锁确保这些危险不会导致错误结果。</p>
+        <p>驱动中并发还需要小心的另一点是：某个进程可能正在等待设备输入，但表示输入到达的中断可能在另一个进程（甚至没有进程）运行时到达。因此中断处理程序不能考虑它们中断的是哪个进程或哪段代码。例如，中断处理程序不能安全地用当前进程的页表调用 <code>copyout</code>。中断处理程序通常只做相对少量工作（例如只是把输入数据复制到缓冲区），并唤醒上半部代码完成剩余工作。</p>
+      </section>
+
+      <section id="section-6-4">
+        <h2 class="chapter">6.4 定时器中断</h2>
+        <p>xv6 使用定时器中断来维护当前时间概念，并在计算密集型进程之间切换。定时器中断来自连接到每个 RISC-V CPU 的时钟硬件。xv6 对每个 CPU 的时钟硬件编程，使其周期性中断该 CPU。</p>
+        <p><code>start.c</code> 中的代码 <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/start.c#L53" target="_blank" rel="noopener">(1102)</a> 设置一些控制位，允许监督者模式访问定时器控制寄存器，并请求第一次定时器中断。<code>time</code> 控制寄存器包含一个由硬件以稳定速率递增的计数，它充当当前时间概念。<code>stimecmp</code> 寄存器包含 CPU 将产生定时器中断的时间；把 <code>stimecmp</code> 设为当前 <code>time</code> 值加 <code>x</code>，就会安排 <code>x</code> 个时间单位后的中断。对于 QEMU 的 RISC-V 模拟，1,000,000 个时间单位大约是十分之一秒。</p>
+        <p>定时器中断和其他设备中断一样，通过 <code>usertrap</code> 或 <code>kerneltrap</code> 以及 <code>devintr</code> 到达。定时器中断到达时，<code>scause</code> 的低位设为 5；<code>trap.c</code> 中的 <code>devintr</code> 检测这种情况并调用 <code>clockintr</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/trap.c#L165" target="_blank" rel="noopener">(3482)</a>。后者递增 <code>ticks</code>，使内核能跟踪时间流逝。递增只在一个 CPU 上发生，以避免多 CPU 时钟让时间流逝得更快。<code>clockintr</code> 唤醒所有在 <code>pause</code> 系统调用中等待的进程，并通过写 <code>stimecmp</code> 安排下一次定时器中断。</p>
+        <p>对定时器中断，<code>devintr</code> 返回 2，以指示 <code>kerneltrap</code> 或 <code>usertrap</code> 应该调用 <code>yield</code>，让 CPU 在可运行进程之间复用。</p>
+        <p>内核代码可能被定时器中断打断，并通过 <code>yield</code> 强制上下文切换；这也是 <code>usertrap</code> 早期代码在启用中断前小心保存 <code>sepc</code> 等状态的部分原因。这些上下文切换还意味着，内核代码必须在知道自己可能毫无预警地从一个 CPU 移到另一个 CPU 的前提下编写。</p>
+      </section>
+
+      <section id="section-6-5">
+        <h2 class="chapter">6.5 现实世界</h2>
+        <p>xv6 和许多操作系统一样，允许在内核中执行时发生中断，甚至通过 <code>yield</code> 发生上下文切换。这样做的原因是在复杂且长时间运行的系统调用期间保持快速响应。然而，如上所述，允许内核中断也是一些复杂性的来源；因此少数操作系统只允许在执行用户代码时发生中断。</p>
+        <p>完整支持典型计算机上的所有设备是一项大量工作，因为设备很多、设备功能很多、设备与驱动之间的协议可能复杂且文档不足。在许多操作系统中，驱动代码比核心内核代码还多。</p>
+        <p>UART 驱动通过读取 UART 控制寄存器一次一个字节地获取数据；这种模式称为编程式 I/O，因为软件驱动数据移动。编程式 I/O 简单，但太慢，无法用于高数据率。需要高速移动大量数据的设备通常使用直接内存访问（DMA）。DMA 设备硬件会直接把进入的数据写入 RAM，并从 RAM 读取要发出的数据。现代磁盘和网络设备使用 DMA。DMA 设备驱动会在 RAM 中准备数据，然后通过一次控制寄存器写入告诉设备处理准备好的数据。</p>
+        <p>当设备需要在不可预测的时间、且不是太频繁地获得关注时，中断是合理的。但中断有较高 CPU 开销。因此网络和磁盘控制器等高速设备会使用技巧减少中断需求。一种技巧是为一整批进入或发出的请求产生一次中断。另一种技巧是驱动完全禁用中断，并周期性检查设备是否需要关注。这种技术称为轮询。设备以高频率执行操作时，轮询有意义；但如果设备大多空闲，轮询会浪费 CPU 时间。有些驱动会根据当前设备负载在轮询和中断之间动态切换。</p>
+        <p>UART 驱动先把进入数据复制到内核缓冲区，再复制到用户空间。低数据率下这样做合理，但对于生成或消费数据很快的设备，这种双重复制会显著降低性能。有些操作系统能够直接在用户空间缓冲区和设备硬件之间移动数据，通常借助 DMA。</p>
+        <p>如第 1 章所述，控制台对应用表现为普通文件，应用使用 <code>read</code> 和 <code>write</code> 系统调用读输入、写输出。应用可能希望控制设备中无法用标准文件系统调用表达的方面（例如启用/禁用控制台驱动的行缓冲）。Unix 操作系统为此提供 <code>ioctl</code> 系统调用。</p>
+        <p>有些计算机用途要求对外部事件作出“实时”响应：响应保证在有限时间内发生。例如在安全关键系统中，错过截止时间可能导致灾难。xv6 不适合实时场景。除其他因素外，xv6 的调度器在决定接下来运行哪个进程时不会考虑实时截止时间，并且 xv6 有较长的禁用中断内核代码路径，所以它可能无法快速响应中断。实时操作系统不仅必须修复这些问题，还必须以允许分析最坏响应时间的方式组织。</p>
+      </section>
+
+      <section id="section-6-6">
+        <h2 class="chapter">6.6 练习</h2>
+        <ol>
+          <li>修改 <code>uart.c</code>，完全不使用中断。你可能还需要修改 <code>console.c</code>。</li>
+          <li>为一块以太网卡添加驱动。</li>
+        </ol>
+      </section>
+
+      <div class="pager">
+        <a href="chapter-05.html">← 第 5 章</a>
+        <a href="chapter-07.html">第 7 章 →</a>
+      </div>
+    </main>
+  </div>
+</body>
+</html>

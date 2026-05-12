@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>第 4 章 陷阱和系统调用 - xv6 中文翻译</title>
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <h2>xv6 中文翻译</h2>
+      <nav aria-label="章节导航">
+        <a href="index.html">标题页</a><a href="foreword.html">前言与致谢</a>
+        <a href="chapter-01.html">第 1 章 操作系统接口</a><a href="chapter-02.html">第 2 章 操作系统组织</a><a href="chapter-03.html">第 3 章 页表</a>
+        <a class="active" href="chapter-04.html">第 4 章 陷阱和系统调用</a>
+        <a class="sub" href="#section-4-1">4.1 RISC-V 陷阱机制</a>
+        <a class="sub" href="#section-4-2">4.2 来自用户空间的陷阱</a>
+        <a class="sub" href="#section-4-3">4.3 代码：调用系统调用</a>
+        <a class="sub" href="#section-4-4">4.4 代码：系统调用参数</a>
+        <a class="sub" href="#section-4-5">4.5 来自内核空间的陷阱</a>
+        <a class="sub" href="#section-4-6">4.6 现实世界</a>
+        <a class="sub" href="#section-4-7">4.7 练习</a>
+        <a href="chapter-05.html">第 5 章 页错误</a><a href="chapter-06.html">第 6 章 中断和设备驱动</a><a href="chapter-07.html">第 7 章 锁</a><a href="chapter-08.html">第 8 章 调度</a><a href="chapter-09.html">第 9 章 睡眠与唤醒</a><a href="chapter-10.html">第 10 章 文件系统</a><a href="chapter-11.html">第 11 章 重谈并发</a><a href="chapter-12.html">第 12 章 总结</a><a href="references.html">参考文献</a>
+      </nav>
+    </aside>
+    <main>
+      <h1 class="page-title">第 4 章 陷阱和系统调用</h1>
+      <p>有三类事件会导致 CPU 暂停普通指令执行，并强制把控制权转移到处理该事件的特殊内核代码。第一类是系统调用：用户程序执行 <code>ecall</code> 指令，请求内核为它做事。第二类是异常：某条指令（用户指令或内核指令）做了非法事情，例如从无效虚拟地址加载。第三类是设备中断：设备发出需要关注的信号，例如磁盘硬件完成读或写请求。</p>
+      <p>本书用陷阱（trap）作为这些情况的统称。通常，在陷阱发生时正在执行的代码之后需要继续运行，并且不应该意识到发生过特殊事件。也就是说，我们常常希望陷阱是透明的；这对设备中断尤其重要，因为被中断的代码通常并不期待中断。陷阱强制控制权进入内核；内核保存寄存器和其他状态，以便之后恢复执行；内核执行适当的处理代码（例如系统调用实现或设备驱动）；内核恢复保存的状态并从陷阱返回；原来的代码从离开的位置继续执行。</p>
+      <p>xv6 在内核中处理所有陷阱；陷阱不会投递给用户代码。系统调用自然应该由内核处理。中断也适合由内核处理，因为隔离要求只有内核能使用设备，而且内核能够在多个进程之间共享设备。异常也适合由内核处理，因为内核可能能处理来自用户空间的异常（第 5 章会给出例子），或者通过杀死出错程序作出响应。</p>
+      <p>xv6 的陷阱处理分四个阶段：RISC-V CPU 执行的硬件动作；为内核 C 代码做准备的少量汇编指令；决定如何处理陷阱的 C 函数；以及系统调用或设备驱动服务例程。虽然三类陷阱之间有共性，似乎内核可以用一条统一路径处理所有陷阱，但实践中把两种不同情况分开更方便：来自用户空间的陷阱，以及来自内核空间的陷阱。处理陷阱的内核代码（汇编或 C）常称为处理程序（handler）；处理程序的第一批指令通常用汇编写成，有时称为向量（vector）。</p>
+      <p>继续之前，请阅读 <code>kernel/trampoline.S</code>，以及 <code>kernel/trap.c</code> 中的 <code>usertrap()</code> 和 <code>prepare_return()</code>。</p>
+
+      <section id="section-4-1">
+        <h2 class="chapter">4.1 RISC-V 陷阱机制</h2>
+        <p>每个 RISC-V CPU 都有一组硬件控制寄存器。内核写这些寄存器，告诉 CPU 如何处理陷阱；内核也读这些寄存器，了解已经发生的陷阱。RISC-V 文档给出了完整说明 <a class="cite" href="references.html#ref-3">[3]</a>。<code>riscv.h</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/riscv.h" target="_blank" rel="noopener">(0500)</a> 包含 xv6 使用的定义。最重要的寄存器概览如下：</p>
+        <ul>
+          <li><code>stvec</code>：内核在这里写入陷阱处理代码的地址；RISC-V 会跳转到 <code>stvec</code> 中的地址处理陷阱。</li>
+          <li><code>sepc</code>：陷阱发生时，RISC-V 在这里保存程序计数器（因为 pc 随后会被 <code>stvec</code> 的值覆盖）。<code>sret</code>（从陷阱返回）指令把 <code>sepc</code> 复制到 pc。内核可以写 <code>sepc</code> 来控制 <code>sret</code> 返回到哪里。</li>
+          <li><code>scause</code>：RISC-V 在这里放入一个数字，描述陷阱原因。</li>
+          <li><code>sscratch</code>：内核陷阱处理代码用它来避免在保存用户寄存器前覆盖用户寄存器。</li>
+          <li><code>sstatus</code>：<code>sstatus</code> 中的 SIE 位控制设备中断是否启用。如果内核清除 SIE，RISC-V 会推迟设备中断，直到内核再次设置 SIE。SPP 位指示陷阱来自用户模式还是监督者模式，并控制 <code>sret</code> 返回到哪种模式。</li>
+        </ul>
+        <p>上述寄存器只能在监督者模式（即由内核）访问；CPU 会阻止用户代码读写它们。多核芯片上的每个 CPU 都有自己的一组这些寄存器，并且任意时刻可能有多个 CPU 正在处理陷阱。</p>
+        <p>当 RISC-V 硬件强制产生陷阱时，会执行以下步骤：</p>
+        <ol>
+          <li>如果陷阱是设备中断，并且 <code>sstatus</code> 的 SIE 位已清除，则不执行后续步骤。</li>
+          <li>通过清除 <code>sstatus</code> 中的 SIE 位禁用中断。</li>
+          <li>把 pc 复制到 <code>sepc</code>。</li>
+          <li>把当前模式（用户或监督者）保存在 <code>sstatus</code> 的 SPP 位中。</li>
+          <li>把陷阱原因编号写入 <code>scause</code>。</li>
+          <li>把模式设为监督者模式。</li>
+          <li>把 <code>stvec</code> 复制到 pc。</li>
+          <li>从新的 pc 开始执行。</li>
+        </ol>
+        <figure id="fig-4-1">
+          <img src="assets/figures/figure-4-1.png" alt="图 4.1：用户代码陷阱处理方式概要" loading="lazy" decoding="async" style="display: block; max-width: 650px; width: 100%; height: auto; margin: 0 auto;">
+          <figcaption>图 4.1：用户代码陷阱处理方式概要。</figcaption>
+        </figure>
+        <p>CPU 不会切换到内核页表，不会切换到内核栈，也不会保存 pc 之外的任何寄存器。这些任务必须由内核软件完成。CPU 在陷阱期间只做最少工作，一个原因是给软件提供灵活性；例如某些操作系统会在某些情况下省略页表切换以提高陷阱性能。</p>
+        <p>可以思考一下，上述步骤中是否有任何一步可以为了更快的陷阱而省略。虽然某些情况下更简单的序列可以工作，但一般而言省略许多步骤会很危险。例如，假设 CPU 不切换程序计数器，那么来自用户空间的陷阱可能在仍执行用户指令的同时切换到监督者模式。这些用户指令可能破坏用户/内核隔离，例如修改 <code>satp</code> 寄存器，使其指向一个允许访问所有物理内存的页表。因此 CPU 切换到内核指定的指令地址，即 <code>stvec</code>，非常重要。</p>
+      </section>
+
+      <section id="section-4-2">
+        <h2 class="chapter">4.2 来自用户空间的陷阱</h2>
+        <p>xv6 根据陷阱发生时是在内核执行还是用户代码执行，采用不同方式处理陷阱。这里讲来自用户代码的陷阱；4.5 节描述来自内核代码的陷阱。</p>
+        <p>用户空间中执行时可能发生陷阱：用户程序发起系统调用（<code>ecall</code> 指令）、做了非法事情，或者设备产生中断。如<a href="#fig-4-1">图 4.1</a>所示，来自用户空间的陷阱高级路径是 <code>uservec</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/trampoline.S#L22" target="_blank" rel="noopener">(3071)</a>，然后是 <code>usertrap</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/trap.c#L38" target="_blank" rel="noopener">(3337)</a>；当内核准备返回时，<code>usertrap</code> 返回到 <code>userret</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/trampoline.S#L101" target="_blank" rel="noopener">(3151)</a>，由它执行 <code>sret</code> 回到用户空间。</p>
+        <p>xv6 陷阱处理设计的一个主要约束是：RISC-V 硬件在强制产生陷阱时不会切换页表。这意味着 <code>stvec</code> 中的陷阱处理地址必须在用户页表中有有效映射，因为陷阱处理代码开始执行时仍在使用用户页表。此外，xv6 的陷阱处理代码需要切换到内核页表；为了在切换后还能继续执行，内核页表也必须映射 <code>stvec</code> 指向的处理程序。</p>
+        <p>xv6 用 trampoline 页满足这些要求。这个页包含 <code>uservec</code>，也就是 <code>stvec</code> 指向的 xv6 陷阱处理代码。trampoline 页在每个进程的页表中都映射到虚拟地址 <code>0x3ffffff000</code>（称为 <code>TRAMPOLINE</code>），这是虚拟地址空间中的最后一页，因此位于程序自身使用的内存之上。trampoline 页在内核页表中也映射到同一虚拟地址。见<a href="chapter-02.html#fig-2-3">图 2.3</a>和<a href="chapter-03.html#fig-3-3">图 3.3</a>。因为 trampoline 页映射在用户页表中，陷阱可以在监督者模式下从那里开始执行。因为 trampoline 页也以同一地址映射在内核地址空间中，陷阱处理程序切换到内核页表后仍能继续执行。</p>
+        <p><code>uservec</code> 陷阱处理程序的代码位于 <code>trampoline.S</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/trampoline.S#L22" target="_blank" rel="noopener">(3071)</a>。<code>uservec</code> 开始时，所有 32 个寄存器都包含被中断用户代码拥有的值。这 32 个值需要保存到某处内存中，以便内核稍后能在返回用户空间前恢复它们。向内存 store 需要一个寄存器保存目标地址，但此刻没有可用的通用寄存器。幸运的是，RISC-V 提供了 <code>sscratch</code> 寄存器。<code>uservec</code> 开头的 <code>csrw</code> 指令把 <code>a0</code> 保存到 <code>sscratch</code>。现在 <code>uservec</code> 有了一个可用寄存器（<code>a0</code>）。</p>
+        <p><code>uservec</code> 的下一个任务是保存 32 个用户寄存器。内核为每个进程分配一页内存保存 <code>trapframe</code> 结构，其中包括保存 32 个用户寄存器的空间 <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/proc.h#L43" target="_blank" rel="noopener">(1992)</a>。由于 <code>satp</code> 仍指向用户页表，<code>uservec</code> 需要在用户地址空间中映射 trapframe。xv6 把每个进程的 trapframe 映射到该进程用户页表中的虚拟地址 <code>TRAPFRAME</code>（<code>0x3fffffe000</code>），也就是 <code>TRAMPOLINE</code> 下面一页。每个进程的 <code>p-&gt;trapframe</code> 包含该进程 trapframe 的内核虚拟地址。</p>
+        <p><code>uservec</code> 把寄存器 <code>a0</code> 设为地址 <code>TRAPFRAME</code>，并把所有用户寄存器保存到那里。随后它从 <code>sscratch</code> 取回用户的 <code>a0</code> 并保存到 trapframe 中。</p>
+        <p>内核先前把一些对 <code>uservec</code> 有用的值初始化到了 trapframe 中：当前进程内核栈地址、当前 CPU 的 hartid、<code>usertrap</code> 函数地址，以及内核页表地址。<code>uservec</code> 取出这些值，把 <code>satp</code> 切换到内核页表，并跳转到 C 函数 <code>usertrap</code>。</p>
+        <p><code>usertrap</code> 的工作是判断陷阱原因、处理它并返回 <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/trap.c#L38" target="_blank" rel="noopener">(3337)</a>。它首先修改 <code>stvec</code>，使内核中的陷阱由 <code>kernelvec</code> 而不是 <code>uservec</code> 处理。它保存 <code>sepc</code> 寄存器（保存的用户程序计数器），以供返回用户空间时使用。如果陷阱是系统调用，<code>usertrap</code> 调用 <code>syscall</code> 处理；如果是设备中断，调用 <code>devintr</code>；如果是页错误，调用 <code>vmfault</code>；否则就是异常（例如使用无效地址），内核会杀死出错进程。系统调用路径会把保存的用户程序计数器加 4，因为 RISC-V 在系统调用情况下会让程序指针指向 <code>ecall</code> 指令，而用户代码需要从下一条指令继续执行。<code>usertrap</code> 检查进程是否已被杀死，或者是否应该让出 CPU（如果这个陷阱是定时器中断）。</p>
+        <p>返回用户空间的第一步是调用 <code>prepare_return</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/trap.c#L100" target="_blank" rel="noopener">(3404)</a>。这个函数设置 RISC-V 控制寄存器，为未来来自用户空间的陷阱做准备：把 <code>stvec</code> 设为 <code>uservec</code>，并准备 <code>uservec</code> 依赖的 trapframe 字段。<code>prepare_return</code> 把 <code>sepc</code> 设为先前保存的用户程序计数器。最后，<code>usertrap</code> 返回 trampoline 页中的 <code>userret</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/trampoline.S#L101" target="_blank" rel="noopener">(3151)</a>，并在 <code>a0</code> 中传回指向用户页表的指针。</p>
+        <p><code>userret</code> 把 <code>satp</code> 切换到进程的用户页表。回忆一下，用户页表映射了 trampoline 页和 <code>TRAPFRAME</code>，但没有映射内核的其他内容。trampoline 页在用户页表和内核页表中位于相同虚拟地址，这让 <code>userret</code> 在改变 <code>satp</code> 后仍能继续执行。从这一点开始，<code>userret</code> 唯一可使用的数据是寄存器内容和 trapframe 内容。<code>userret</code> 把 <code>TRAPFRAME</code> 地址加载到 <code>a0</code>，通过 <code>a0</code> 从 trapframe 恢复保存的用户寄存器，恢复保存的用户 <code>a0</code>，并执行 <code>sret</code> 回到用户空间。</p>
+        <p><code>uservec</code> 和 <code>userret</code> 用汇编语言编写，因为用 C 代码保存或恢复所有寄存器，以及在切换页表后继续存活，都很困难。</p>
+      </section>
+
+      <section id="section-4-3">
+        <h2 class="chapter">4.3 代码：调用系统调用</h2>
+        <p>用户程序调用库函数来发起系统调用。例如，shell 用下面的函数调用显示提示符（在 <code>user/sh.c</code> 中）：</p>
+        <pre><code>write(2, "$ ", 2);</code></pre>
+        <p>下面是 <code>user/usys.S</code> 中的库函数：</p>
+        <pre><code>write:
+ li a7, SYS_write
+ ecall
+ ret</code></pre>
+        <p>C 编译器为函数调用生成的代码会把三个参数加载到寄存器 <code>a0</code>、<code>a1</code> 和 <code>a2</code> 中。然后 <code>write()</code> 函数把系统调用号 <code>SYS_write</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/syscall.h#L17" target="_blank" rel="noopener">(3566)</a> 加载到 <code>a7</code>。内核会查看这些寄存器，确定目标系统调用和参数。<code>ecall</code> 指令从用户空间陷入内核，并导致 <code>uservec</code>、<code>usertrap</code>，然后 <code>syscall</code> 执行。</p>
+        <p>此时请阅读 <code>kernel/syscall.c</code>、<code>kernel/sysfile.c</code> 中的 <code>sys_write()</code>，以及 <code>kernel/vm.c</code> 中的 <code>copyout()</code>、<code>copyin()</code> 和 <code>copyinstr()</code>。</p>
+        <p><code>syscall</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/syscall.c#L132" target="_blank" rel="noopener">(3731)</a> 从 trapframe 中保存的 <code>a7</code> 取出系统调用号，并用它索引 <code>syscalls</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/syscall.c#L107" target="_blank" rel="noopener">(3706)</a>。在上面的例子中，<code>a7</code> 包含 <code>SYS_write</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/syscall.h#L17" target="_blank" rel="noopener">(3566)</a>，因此会调用系统调用实现函数 <code>sys_write</code>。</p>
+        <p><code>sys_write</code> 返回时，<code>syscall</code> 把其返回值记录到 <code>p-&gt;trapframe-&gt;a0</code>。这会使原始用户空间调用 <code>write()</code> 返回该值，因为 RISC-V 的 C 调用约定把返回值放在 <code>a0</code> 中。系统调用通常用负数表示错误，用零或正数表示成功。</p>
+      </section>
+
+      <section id="section-4-4">
+        <h2 class="chapter">4.4 代码：系统调用参数</h2>
+        <p>系统调用参数最初位于用户寄存器中，随后由内核陷阱代码移动到 trap frame。内核函数 <code>argint</code>、<code>argaddr</code> 和 <code>argfd</code> 从 trap frame 取出第 n 个系统调用参数，分别作为整数、指针或文件描述符。</p>
+        <p>有些系统调用把指针作为参数，内核必须用这些指针读写用户内存。例如 <code>write</code> 系统调用会把用户空间中要写入数据的指针传给内核。这类指针带来两个挑战。第一，用户程序可能有 bug 或恶意，可能传给内核一个无效指针，或者一个试图诱骗内核访问内核内存而非用户内存的指针。第二，xv6 内核页表映射和用户页表映射不同，因此内核不能用普通指令从用户提供的地址 load 或 store。</p>
+        <p>内核实现了一些函数，用来安全地在用户提供的地址之间传输数据。<code>fetchstr</code> 就是一个例子 <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/syscall.c#L25" target="_blank" rel="noopener">(3624)</a>。像 <code>exec</code> 这样的文件系统调用使用 <code>fetchstr</code> 从用户空间取出字符串文件名参数。<code>fetchstr</code> 调用 <code>copyinstr</code> 完成困难部分。</p>
+        <p><code>copyinstr</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/vm.c#L410" target="_blank" rel="noopener">(1833)</a> 从用户页表 <code>pagetable</code> 中的虚拟地址 <code>srcva</code> 最多复制 <code>max</code> 字节到 <code>dst</code>。由于 <code>pagetable</code> 不是当前页表，<code>copyinstr</code> 使用 <code>walkaddr</code>（它调用 <code>walk</code>）在 <code>pagetable</code> 中查找 <code>srcva</code>，得到物理地址 <code>pa0</code>。内核页表把所有物理 RAM 映射到等于 RAM 物理地址的虚拟地址。这允许 <code>copyinstr</code> 直接从 <code>pa0</code> 复制字符串字节到 <code>dst</code>。<code>walkaddr</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/vm.c#L121" target="_blank" rel="noopener">(1520)</a> 检查用户提供的虚拟地址是否属于进程的用户地址空间，因此程序不能诱骗内核读取其他内存。类似函数 <code>copyout</code> 把数据从内核复制到用户提供的地址。</p>
+      </section>
+
+      <section id="section-4-5">
+        <h2 class="chapter">4.5 来自内核空间的陷阱</h2>
+        <p>请阅读 <code>kernel/kernelvec.S</code>，以及 <code>kernel/trap.c</code> 中的 <code>kerneltrap()</code>。</p>
+        <p>xv6 对来自内核代码的陷阱采用不同于用户代码陷阱的处理方式。进入内核时，<code>usertrap</code> 会把 <code>stvec</code> 指向 <code>kernelvec</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/kernelvec.S#L12" target="_blank" rel="noopener">(3211)</a> 处的汇编代码。由于 <code>kernelvec</code> 只会在 xv6 已经处于内核中时执行，<code>kernelvec</code> 可以依赖 <code>satp</code> 已设为内核页表，栈指针也指向有效内核栈。<code>kernelvec</code> 把所有 32 个寄存器压入当前栈，稍后从那里恢复，使被中断的内核代码能不受干扰地继续。</p>
+        <p><code>kernelvec</code> 把寄存器保存在被中断内核线程的栈上，这是合理的，因为寄存器值属于该线程。如果陷阱导致切换到另一个线程，这一点尤其重要；在这种情况下，陷阱实际上会从新线程的栈返回，而被中断线程保存的寄存器会安全地留在自己的栈上。</p>
+        <p>保存寄存器后，<code>kernelvec</code> 跳转到 <code>kerneltrap</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/trap.c#L136" target="_blank" rel="noopener">(3453)</a>。<code>kerneltrap</code> 只准备处理一种陷阱：设备中断。它调用 <code>devintr</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/trap.c#L186" target="_blank" rel="noopener">(3506)</a> 处理它们。如果陷阱不是设备中断，那就一定是异常，例如内核代码试图使用无效指针。这只能由内核代码 bug 导致。内核在这种情况下无法恢复，因此调用 <code>panic()</code>，打印错误信息并停止。</p>
+        <p>如果 <code>kerneltrap</code> 是由于定时器中断被调用，并且某个进程的内核线程正在运行（而不是调度器线程），<code>kerneltrap</code> 会调用 <code>yield</code>，让其他线程有机会运行。之后某个线程会让出 CPU，使我们的线程及其 <code>kerneltrap</code> 再次恢复。第 8 章解释 <code>yield</code> 中发生的事情。</p>
+        <p><code>kerneltrap</code> 完成工作后，需要返回到被陷阱中断的代码。由于 <code>yield</code> 可能扰乱 <code>sepc</code> 和 <code>sstatus</code> 中的先前模式，<code>kerneltrap</code> 一开始会保存它们。现在它恢复这些控制寄存器并返回 <code>kernelvec</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/kernelvec.S#L38" target="_blank" rel="noopener">(3237)</a>。<code>kernelvec</code> 从栈中弹出保存的寄存器并执行 <code>sret</code>，这会把 <code>sepc</code> 复制到 pc，并恢复被中断的内核代码。</p>
+        <p>xv6 在 CPU 从用户空间进入内核时，把该 CPU 的 <code>stvec</code> 设为 <code>kernelvec</code>；你可以在 <code>usertrap</code> 中看到这一点 <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/trap.c#L47" target="_blank" rel="noopener">(3346)</a>。但有一小段时间，内核已经开始执行而 <code>stvec</code> 仍设为 <code>uservec</code>，在这段时间内绝不能发生设备中断。幸运的是，RISC-V 在开始接收陷阱时总会禁用中断，并且 <code>usertrap</code> 在设置 <code>stvec</code> 之后才重新启用中断。</p>
+      </section>
+
+      <section id="section-4-6">
+        <h2 class="chapter">4.6 现实世界</h2>
+        <p>如果把内核内存映射到每个进程的用户页表中（清除 <code>PTE_U</code>），就可以消除对 trampoline 页的需求。这也会消除从用户空间陷入内核时切换页表的需求。进而，内核中的系统调用实现可以利用当前进程的用户内存已经被映射这一事实，让内核代码直接解引用用户指针。许多操作系统使用过这些思想来提高效率。xv6 避免使用它们，是为了降低内核因意外使用用户指针而出现安全 bug 的可能性，并减少一些为了确保用户虚拟地址和内核虚拟地址不重叠而需要的复杂性。</p>
+      </section>
+
+      <section id="section-4-7">
+        <h2 class="chapter">4.7 练习</h2>
+        <ol>
+          <li><code>trampoline.S</code> 和 <code>kernelvec.S</code> 中的部分或全部代码能否用 C 而不是汇编编写？</li>
+          <li>有没有办法消除每个用户地址空间中对特殊 <code>TRAPFRAME</code> 页的映射？例如，能否修改 <code>uservec</code>，使它简单地把 32 个用户寄存器压入内核栈，或者存储到 <code>proc</code> 结构中？</li>
+          <li>xv6 能否修改为消除特殊的 <code>TRAMPOLINE</code> 页映射？</li>
+        </ol>
+      </section>
+
+      <div class="pager">
+        <a href="chapter-03.html">← 第 3 章</a>
+        <a href="chapter-05.html">第 5 章 →</a>
+      </div>
+    </main>
+  </div>
+</body>
+</html>

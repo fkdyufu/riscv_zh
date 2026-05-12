@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>第 5 章 页错误 - xv6 中文翻译</title>
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <h2>xv6 中文翻译</h2>
+      <nav aria-label="章节导航">
+        <a href="index.html">标题页</a><a href="foreword.html">前言与致谢</a><a href="chapter-01.html">第 1 章 操作系统接口</a><a href="chapter-02.html">第 2 章 操作系统组织</a><a href="chapter-03.html">第 3 章 页表</a><a href="chapter-04.html">第 4 章 陷阱和系统调用</a>
+        <a class="active" href="chapter-05.html">第 5 章 页错误</a>
+        <a class="sub" href="#section-5-1">5.1 惰性分配</a>
+        <a class="sub" href="#section-5-2">5.2 代码</a>
+        <a class="sub" href="#section-5-3">5.3 现实世界：COW fork</a>
+        <a class="sub" href="#section-5-4">5.4 现实世界：按需分页</a>
+        <a class="sub" href="#section-5-5">5.5 现实世界：内存映射文件</a>
+        <a class="sub" href="#section-5-6">5.6 练习</a>
+        <a href="chapter-06.html">第 6 章 中断和设备驱动</a><a href="chapter-07.html">第 7 章 锁</a><a href="chapter-08.html">第 8 章 调度</a><a href="chapter-09.html">第 9 章 睡眠与唤醒</a><a href="chapter-10.html">第 10 章 文件系统</a><a href="chapter-11.html">第 11 章 重谈并发</a><a href="chapter-12.html">第 12 章 总结</a><a href="references.html">参考文献</a>
+      </nav>
+    </aside>
+    <main>
+      <h1 class="page-title">第 5 章 页错误</h1>
+      <p>当使用的虚拟地址在页表中没有映射、映射的 <code>PTE_V</code> 标志被清除，或者映射的权限位（<code>PTE_R</code>、<code>PTE_W</code>、<code>PTE_X</code>、<code>PTE_U</code>）禁止正在尝试的操作时，RISC-V CPU 会产生页错误异常。RISC-V 区分三类页错误：load 页错误（由 load 指令导致）、store 页错误（由 store 指令导致）和 instruction 页错误（由取待执行指令导致）。<code>scause</code> 寄存器指示页错误类型，<code>stval</code> 寄存器保存无法翻译的地址。</p>
+      <p>页表与页错误的组合是一种强大工具。页表在虚拟地址和物理地址之间给内核提供一层间接性，使内核可以控制地址空间的结构和内容。页错误允许内核拦截 load 和 store，并通过修改页表即时指定这些引用实际指向什么数据。内核可以利用这些能力提升效率：例如写时复制 fork 允许内核透明地在父子进程之间共享内存，避免复制双方都不写的页。应用程序员也能受益。一种可能是内存映射文件，内核利用分页让文件内容出现在应用地址空间中，并在页错误发生时透明地读取文件块。另一种是惰性内存分配，它允许程序请求巨大的虚拟地址空间，但只为程序实际读写的页支付分配物理内存的成本。xv6 只把页错误用于一个目的：惰性分配。</p>
+      <p>继续之前，请阅读 <code>kernel/sysproc.c</code> 中的 <code>sys_sbrk()</code>，以及 <code>kernel/vm.c</code> 中的 <code>vmfault</code>。搜索 <code>kernel/trap.c</code> 和 <code>kernel/vm.c</code> 中对 <code>vmfault</code> 的调用。</p>
+
+      <section id="section-5-1">
+        <h2 class="chapter">5.1 惰性分配</h2>
+        <p>xv6 的惰性分配有两个部分。第一，当应用通过带 <code>SBRK_LAZY</code> 标志调用 <code>sbrk</code> 请求内存时，内核只记录大小增加，但不分配物理内存，也不为新的虚拟地址范围创建 PTE。第二，当这些新地址之一发生页错误时，内核分配一页物理内存并把它映射到页表中。内核对应用透明地实现惰性分配：应用无需修改即可受益。</p>
+        <p>惰性分配对应用很方便，因为应用不必准确预测自己需要多少内存。例如，应用可能处理输入，但事先不知道输入有多大。使用惰性分配时，应用可以按最坏情况请求内存，但不必为最坏情况付出代价：对于应用从未使用的页，内核完全不需要做任何工作。</p>
+        <p>此外，如果应用请求把地址空间扩展很多，那么没有惰性分配的 <code>sbrk</code> 会很昂贵：如果应用请求 1 GB 内存，内核必须分配并清零 262,144 个 4096 字节物理页。惰性分配允许把这个成本分摊到之后的时间。另一方面，惰性分配会带来额外的页错误开销，其中包含一次用户/内核转换。操作系统可以通过每次页错误分配一批连续页而不是一页，并为这种页错误专门优化内核进入/退出代码，来降低成本（xv6 两者都没有做）。</p>
+        <p>另一方面，当为惰性分配页处理页错误时，内核可能发现没有空闲内存可分配。在这种情况下，内核没有简单办法向应用返回内存不足错误，于是会杀死该应用。对于希望分配失败时得到错误的应用，xv6 允许通过带 <code>SBRK_EAGER</code> 标志调用 <code>sbrk</code> 来立即分配内存。</p>
+      </section>
+
+      <section id="section-5-2">
+        <h2 class="chapter">5.2 代码</h2>
+        <p>系统调用 <code>sbrk(n)</code> 会把进程内存大小增加 <code>n</code> 字节（如果 <code>n</code> 为负则缩小），并返回新分配区域的起点（即旧大小）。内核实现是 <code>sys_sbrk</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/sysproc.c#L40" target="_blank" rel="noopener">(3801)</a>。</p>
+        <p>如果应用指定 <code>SBRK_EAGER</code>，系统调用由函数 <code>growproc</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/proc.c#L237" target="_blank" rel="noopener">(2353)</a> 实现。<code>growproc</code> 调用 <code>uvmalloc</code>。<code>uvmalloc</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/vm.c#L217" target="_blank" rel="noopener">(1628)</a> 用 <code>kalloc</code> 分配物理内存，清零分配的内存，并用 <code>mappages</code> 向用户页表添加 PTE。</p>
+        <p>如果应用惰性分配内存，<code>sys_sbrk</code> 只把进程大小（<code>myproc()-&gt;sz</code>）增加 <code>n</code> 并返回旧大小；它不分配物理内存，也不向进程页表添加 PTE。</p>
+        <p>当进程 load 或 store 到缺少有效页表映射的虚拟地址时，CPU 会产生页错误异常。<code>usertrap</code> 检查这种情况 <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/trap.c#L73" target="_blank" rel="noopener">(3372)</a> 并调用 <code>vmfault</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/vm.c#L453" target="_blank" rel="noopener">(1879)</a> 处理页错误。<code>vmfault</code> 检查出错地址是否位于先前由 <code>sbrk</code> 授予的区域中，用 <code>kalloc</code> 分配一页物理内存，清零该页，并用 <code>mappages</code> 向用户页表添加 PTE。xv6 为新页的 PTE 设置 <code>PTE_W</code>、<code>PTE_R</code>、<code>PTE_U</code> 和 <code>PTE_V</code> 标志。随后 <code>usertrap</code> 让进程从导致错误的指令处继续。因为 PTE 现在有效，重新执行的 load 或 store 指令将不会再触发错误。</p>
+        <p>如果应用用 <code>sbrk</code> 释放内存，<code>sys_sbrk</code> 调用 <code>shrinkproc</code>，后者调用 <code>uvmdealloc</code>。真正工作由 <code>uvmunmap</code> <a class="source-ref" href="https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/vm.c#L193" target="_blank" rel="noopener">(1604)</a> 完成，它用 <code>walk</code> 查找 PTE。由于某些页可能从未被进程使用，因此从未由 <code>vmfault</code> 分配，<code>uvmunmap</code> 会跳过没有 <code>PTE_V</code> 标志的 PTE。如果某个 PTE 映射有效，<code>uvmunmap</code> 调用 <code>kfree</code> 释放它引用的物理内存。</p>
+        <p>注意，xv6 使用进程页表不仅是为了告诉硬件如何映射用户虚拟地址，也是为了作为分配给该进程的物理内存页的唯一记录。这就是释放用户内存（在 <code>uvmunmap</code> 中）必须检查用户页表的原因。</p>
+      </section>
+
+      <section id="section-5-3">
+        <h2 class="chapter">5.3 现实世界：写时复制（COW）fork</h2>
+        <p>许多内核（但 xv6 不是）使用页错误来实现写时复制（copy-on-write，COW）fork。<code>fork</code> 系统调用承诺，子进程看到的内存初始内容与 fork 时父进程的内存相同。一种实现方法是把父进程的整个内存复制到为子进程新分配的物理内存中；xv6 就是这样做的。复制可能很慢，如果子进程能共享父进程的物理内存会更高效。然而简单共享无法工作，因为父子进程写共享栈和堆时会互相干扰。</p>
+        <p>写时复制 fork 通过恰当使用页表权限和页错误，让父子进程安全地共享物理内存。基本计划是父子进程最初共享所有物理页，但双方都把这些页映射为只读（清除 <code>PTE_W</code> 标志）。父子进程随后可以读取共享物理内存。如果任一方写共享页，RISC-V CPU 会产生页错误异常。支持 COW 的内核会响应这个错误：分配一页新物理内存，并把共享页复制到新页中。随后内核把出错进程页表中相关 PTE 改为指向副本，并允许读写，然后让出错进程从导致错误的指令处继续。由于 PTE 现在允许写，重新执行的 store 指令不会再出错，并且会修改该页的私有副本，而不是共享页。</p>
+        <p>写时复制需要记账，以帮助决定物理页何时可以释放，因为每个页根据 fork、页错误、exec 和 exit 的历史，可能被不同数量的页表引用。这个记账支持一项重要优化：如果进程发生 store 页错误，而该物理页只被这个进程的页表引用，就不需要复制。</p>
+        <p>写时复制让 <code>fork</code> 更快，因为 <code>fork</code> 不必复制内存。有些内存之后在写入时仍要复制，但通常大部分内存从不需要复制。一个常见例子是 fork 随后 exec：fork 后可能写少数页，但子进程的 exec 随后会释放从父进程继承的大部分内存。写时复制 fork 消除了复制这部分内存的需求。此外，COW fork 对应用透明：应用无需修改即可受益。</p>
+      </section>
+
+      <section id="section-5-4">
+        <h2 class="chapter">5.4 现实世界：按需分页</h2>
+        <p>另一个广泛使用页错误的特性是按需分页。在 <code>exec</code> 系统调用中，xv6 会在启动应用前把应用的所有文本和数据加载到内存中。由于应用可能很大，从磁盘读取又需要时间，这个启动成本对用户可能很明显。为了降低启动时间，现代内核最初不会把可执行文件加载到内存，而只是创建用户页表，并把所有 PTE 标记为无效。内核启动程序运行；每当程序第一次使用某页时，页错误发生，内核响应该错误，从磁盘读取该页内容并把它映射到用户地址空间。和 COW fork、惰性分配一样，内核可以对应用透明地实现这个特性。</p>
+        <p>计算机上运行的程序可能需要的内存多于计算机拥有的 RAM。为了优雅应对，操作系统可以实现换页到磁盘。思想是只把一部分用户页保存在 RAM 中，其余存放在磁盘上的换页区。内核把对应于换页区中内存（因此不在 RAM 中）的 PTE 标记为无效。如果应用尝试使用一个已经换出到磁盘的页，应用会发生页错误，该页必须换入：内核陷阱处理程序会分配一页物理 RAM，从磁盘把该页读入 RAM，并修改相关 PTE 指向 RAM。</p>
+        <p>如果需要换入一页，但没有空闲物理 RAM，会发生什么？这种情况下，内核必须先通过把某个物理页换出或驱逐到磁盘换页区，并把引用该物理页的 PTE 标记为无效，来释放一页物理内存。驱逐很昂贵，因此如果驱逐很少发生，分页效果最好：应用只使用自己内存页的一个子集，并且这些子集的并集能放入 RAM。这个性质常称为良好的引用局部性。和许多虚拟内存技术一样，内核通常以对应用透明的方式实现换页到磁盘。</p>
+        <p>无论硬件提供多少 RAM，计算机常常都以很少或没有空闲物理内存的状态运行。例如，云服务商会在单台机器上复用许多客户，以高效使用硬件成本。又如，用户在物理内存较小的智能手机上运行许多应用。在这些环境中，分配一页可能需要先驱逐现有页。因此，当空闲物理内存稀缺时，分配很昂贵。</p>
+        <p>当空闲内存稀缺，且程序只主动使用其已分配内存的一部分时，惰性分配和按需分页尤其有优势。这些技术还可以避免浪费工作：某页被分配或加载后，可能从未使用，或者在使用前就被驱逐。</p>
+      </section>
+
+      <section id="section-5-5">
+        <h2 class="chapter">5.5 现实世界：内存映射文件</h2>
+        <p>其他结合分页和页错误异常的特性包括自动扩展栈，以及内存映射文件。内存映射文件是程序用 <code>mmap</code> 系统调用映射进自己地址空间的文件，使程序可以用 load 和 store 指令读写它们。</p>
+      </section>
+
+      <section id="section-5-6">
+        <h2 class="chapter">5.6 练习</h2>
+        <ol>
+          <li>编写一个用户程序，通过调用 <code>sbrk(1)</code> 让自己的地址空间增长一个字节。运行该程序，研究调用 <code>sbrk</code> 前后该程序的页表。内核分配了多少空间？新内存的 PTE 包含什么？</li>
+          <li>实现 COW fork。</li>
+          <li>实现 <code>mmap</code>。</li>
+        </ol>
+      </section>
+
+      <div class="pager">
+        <a href="chapter-04.html">← 第 4 章</a>
+        <a href="chapter-06.html">第 6 章 →</a>
+      </div>
+    </main>
+  </div>
+</body>
+</html>
